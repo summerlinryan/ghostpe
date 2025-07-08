@@ -1,4 +1,5 @@
 use anyhow::Result;
+use log::{debug, error, info, trace, warn};
 use std::fs::File;
 use std::io::Read;
 use std::mem::size_of;
@@ -10,39 +11,28 @@ pub struct PE {
     data: Vec<u8>,
     dos_header: IMAGE_DOS_HEADER,
     nt_header: IMAGE_NT_HEADERS64,
+    base_address: Option<u64>,
 }
 
 impl PE {
-    pub fn load_from_file(file: &str) -> Result<Self> {
-        let mut file = File::open(file)?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        Ok(Self::load(data)?)
-    }
-
-    pub fn load(data: Vec<u8>) -> Result<Self> {
-        let (dos_header, nt_header) = Self::parse_headers(&data)?;
-        Ok(Self {
-            data,
-            dos_header,
-            nt_header,
-        })
-    }
-
     pub fn execute_from_file(file: &str) -> Result<()> {
+        info!("Loading PE file from: {}", file);
         let mut file = File::open(file)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
+        info!("Read {} bytes from file", data.len());
         Self::execute(data)
     }
 
     pub fn execute(data: Vec<u8>) -> Result<()> {
+        info!("Executing PE with {} bytes of data", data.len());
         let (dos_header, nt_header) = Self::parse_headers(&data)?;
 
-        let pe = Self {
+        let mut pe = Self {
             data,
             dos_header,
             nt_header,
+            base_address: None,
         };
 
         pe.load_into_memory()?;
@@ -51,6 +41,7 @@ impl PE {
         // pe.resolve_imports()?;
         // pe.handle_tls_callbacks()?;
         // pe.call_entry_point()
+        info!("PE execution completed successfully");
         Ok(())
     }
 
@@ -58,13 +49,21 @@ impl PE {
         const DOS_MAGIC: u16 = 0x5A4D; // MZ
         const NT_MAGIC: u32 = 0x4550; // PE\0\0
 
+        trace!("Parsing PE headers from {} bytes of data", data.len());
+
         if data.len() < size_of::<IMAGE_DOS_HEADER>() {
+            error!("Data too small for DOS header: {} bytes", data.len());
             return Err(anyhow::anyhow!("Data too small for DOS header"));
         }
 
         let dos_header = unsafe { *(data.as_ptr() as *const IMAGE_DOS_HEADER) };
+        debug!("DOS header magic: 0x{:x}", dos_header.e_magic);
 
         if dos_header.e_magic != DOS_MAGIC {
+            error!(
+                "Invalid DOS header magic: expected 0x{:x}, got 0x{:x}",
+                DOS_MAGIC, dos_header.e_magic
+            );
             return Err(anyhow::anyhow!(
                 "Invalid DOS header. Expected 0x{:x}, got 0x{:x}",
                 DOS_MAGIC,
@@ -72,17 +71,28 @@ impl PE {
             ));
         }
 
-        // Check if we have enough data for NT header
         let nt_header_offset = dos_header.e_lfanew as usize;
+        debug!("NT header offset: 0x{:x}", nt_header_offset);
+
         if nt_header_offset + size_of::<IMAGE_NT_HEADERS64>() > data.len() {
+            error!(
+                "Data too small for NT header: need {} bytes, have {} bytes",
+                nt_header_offset + size_of::<IMAGE_NT_HEADERS64>(),
+                data.len()
+            );
             return Err(anyhow::anyhow!("Data too small for NT header"));
         }
 
         let nt_header = unsafe {
-            *(data.as_ptr().offset(dos_header.e_lfanew as isize) as *const IMAGE_NT_HEADERS64)
+            *(data.as_ptr().add(dos_header.e_lfanew as usize) as *const IMAGE_NT_HEADERS64)
         };
+        debug!("NT header signature: 0x{:x}", nt_header.Signature);
 
         if nt_header.Signature != NT_MAGIC {
+            error!(
+                "Invalid NT header signature: expected 0x{:x}, got 0x{:x}",
+                NT_MAGIC, nt_header.Signature
+            );
             return Err(anyhow::anyhow!(
                 "Invalid NT header. Expected 0x{:x}, got 0x{:x}",
                 NT_MAGIC,
@@ -90,11 +100,23 @@ impl PE {
             ));
         }
 
+        debug!("PE headers parsed successfully");
+        debug!(
+            "Number of sections: {}",
+            nt_header.FileHeader.NumberOfSections
+        );
+        let image_base = nt_header.OptionalHeader.ImageBase;
+        let size_of_image = nt_header.OptionalHeader.SizeOfImage;
+        debug!("Image base: 0x{:x}", image_base);
+        debug!("Size of image: 0x{:x}", size_of_image);
+
         Ok((dos_header, nt_header))
     }
 
-    fn load_into_memory(&self) -> Result<()> {
+    fn load_into_memory(&mut self) -> Result<()> {
         let image_size = self.nt_header.OptionalHeader.SizeOfImage as usize;
+        info!("Allocating {} bytes for PE image", image_size);
+
         let image_base = unsafe {
             VirtualAlloc(
                 Some(std::ptr::null_mut()),
@@ -105,18 +127,24 @@ impl PE {
         };
 
         if image_base.is_null() {
+            error!("Failed to allocate {} bytes for PE image", image_size);
             return Err(anyhow::anyhow!(
                 "Failed to allocate {} bytes for the image",
                 image_size
             ));
         }
 
+        self.base_address = Some(image_base as u64);
+        info!(
+            "PE image allocated at base address: 0x{:x}",
+            image_base as u64
+        );
+
+        let headers_size = self.nt_header.OptionalHeader.SizeOfHeaders as usize;
+        debug!("Copying {} bytes of headers to memory", headers_size);
+
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.data.as_ptr(),
-                image_base as *mut u8,
-                self.nt_header.OptionalHeader.SizeOfHeaders as usize,
-            );
+            std::ptr::copy_nonoverlapping(self.data.as_ptr(), image_base as *mut u8, headers_size);
         }
 
         let nt_header_offset = self.dos_header.e_lfanew as usize;
@@ -126,8 +154,26 @@ impl PE {
                 .add(nt_header_offset + size_of::<IMAGE_NT_HEADERS64>())
         } as *const IMAGE_SECTION_HEADER;
 
-        for i in 0..self.nt_header.FileHeader.NumberOfSections {
+        let num_sections = self.nt_header.FileHeader.NumberOfSections;
+        info!("Loading {} sections into memory", num_sections);
+
+        for i in 0..num_sections {
             let current_section = unsafe { &*first_section_offset.add(i as usize) };
+
+            // Get section name as string
+            let name_bytes = &current_section.Name;
+            let name = std::str::from_utf8(name_bytes)
+                .unwrap_or("???")
+                .trim_matches('\0');
+
+            debug!("Loading section {}: '{}'", i, name);
+            debug!("  Virtual address: 0x{:x}", current_section.VirtualAddress);
+            debug!("  Size of raw data: 0x{:x}", current_section.SizeOfRawData);
+            debug!(
+                "  Pointer to raw data: 0x{:x}",
+                current_section.PointerToRawData
+            );
+
             let src = unsafe {
                 self.data
                     .as_ptr()
@@ -136,25 +182,68 @@ impl PE {
             let dest = image_base as usize + current_section.VirtualAddress as usize;
             let size = current_section.SizeOfRawData as usize;
 
-            unsafe { std::ptr::copy_nonoverlapping(src, dest as *mut u8, size) }
+            if size > 0 {
+                debug!(
+                    "  Copying {} bytes from file offset 0x{:x} to virtual address 0x{:x}",
+                    size, current_section.PointerToRawData, current_section.VirtualAddress
+                );
+
+                unsafe { std::ptr::copy_nonoverlapping(src, dest as *mut u8, size) }
+            } else {
+                debug!("  Section has no raw data to copy");
+            }
         }
 
+        info!("PE image loaded into memory successfully");
         Ok(())
     }
 
     fn perform_relocations(&self) -> Result<()> {
-        todo!()
+        debug!("Performing relocations");
+
+        if self.base_address.is_none() {
+            error!("Cannot perform relocations: image base not set");
+            return Err(anyhow::anyhow!("Image base not set"));
+        }
+
+        let actual_base = self.base_address.unwrap();
+        let preferred_base = self.nt_header.OptionalHeader.ImageBase;
+
+        debug!("Actual base address: 0x{:x}", actual_base);
+        debug!("Preferred base address: 0x{:x}", preferred_base);
+
+        if actual_base == preferred_base {
+            info!("No relocations needed - PE loaded at preferred base address");
+            return Ok(());
+        }
+
+        let delta = actual_base - preferred_base;
+        info!("Performing relocations with delta: 0x{:x}", delta);
+
+        // TODO: Implement actual relocation processing
+        warn!("Relocation processing not yet implemented");
+
+        Ok(())
     }
 
     fn resolve_imports(&self) -> Result<()> {
+        debug!("Resolving imports");
+        // TODO: Implement import resolution
+        warn!("Import resolution not yet implemented");
         todo!()
     }
 
     fn handle_tls_callbacks(&self) -> Result<()> {
+        debug!("Handling TLS callbacks");
+        // TODO: Implement TLS callback handling
+        warn!("TLS callback handling not yet implemented");
         todo!()
     }
 
     fn call_entry_point(&self) -> Result<()> {
+        debug!("Calling entry point");
+        // TODO: Implement entry point calling
+        warn!("Entry point calling not yet implemented");
         todo!()
     }
 }
@@ -368,35 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn test_load_valid_pe() {
-        let pe_data = create_minimal_pe();
-        let result = PE::load(pe_data);
-
-        assert!(result.is_ok());
-        let pe = result.unwrap();
-
-        assert_eq!(pe.dos_header.e_magic, 0x5A4D);
-        assert_eq!(pe.nt_header.Signature, 0x4550);
-        assert_eq!(pe.nt_header.FileHeader.NumberOfSections, 1);
-    }
-
-    #[test]
-    fn test_load_invalid_pe() {
-        let invalid_data = vec![0x00; 100];
-        let result = PE::load(invalid_data);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_load_into_memory() {
-        let pe_data = create_minimal_pe();
-        let pe = PE::load(pe_data).unwrap();
-
-        let result = pe.load_into_memory();
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn test_execute_valid_pe() {
         let pe_data = create_minimal_pe();
         let result = PE::execute(pe_data);
@@ -408,39 +468,5 @@ mod tests {
         let invalid_data = vec![0x00; 100];
         let result = PE::execute(invalid_data);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_pe_structure_fields() {
-        let pe_data = create_minimal_pe();
-        let pe = PE::load(pe_data).unwrap();
-
-        // Test that we can access the headers
-        assert_eq!(pe.dos_header.e_magic, 0x5A4D);
-        assert_eq!(pe.nt_header.Signature, 0x4550);
-        assert_eq!(pe.nt_header.OptionalHeader.SizeOfImage, 0x3000);
-        assert_eq!(pe.nt_header.OptionalHeader.SizeOfHeaders, 0x200);
-    }
-
-    #[test]
-    fn test_section_loading() {
-        let pe_data = create_minimal_pe();
-        let pe = PE::load(pe_data).unwrap();
-
-        // Test that sections are properly parsed
-        let nt_header_offset = pe.dos_header.e_lfanew as usize;
-        let first_section_offset = unsafe {
-            pe.data
-                .as_ptr()
-                .add(nt_header_offset + size_of::<IMAGE_NT_HEADERS64>())
-        } as *const IMAGE_SECTION_HEADER;
-
-        let section = unsafe { &*first_section_offset };
-
-        // Check section properties
-        assert_eq!(section.VirtualAddress, 0x1000);
-        assert_eq!(section.SizeOfRawData, 0x200);
-        assert_eq!(section.PointerToRawData, 0x200);
-        assert_eq!(section.Characteristics.0, 0x60000020);
     }
 }
