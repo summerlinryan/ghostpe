@@ -3,9 +3,13 @@ use log::{debug, error, info, trace, warn};
 use std::fs::File;
 use std::io::Read;
 use std::mem::size_of;
-use windows::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+use windows::Win32::System::Diagnostics::Debug::{
+    IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+};
 use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-use windows::Win32::System::SystemServices::IMAGE_DOS_HEADER;
+use windows::Win32::System::SystemServices::{
+    IMAGE_BASE_RELOCATION, IMAGE_DOS_HEADER, IMAGE_REL_BASED_DIR64,
+};
 
 pub struct PE {
     data: Vec<u8>,
@@ -36,8 +40,7 @@ impl PE {
         };
 
         pe.load_into_memory()?;
-
-        // pe.perform_relocations()?;
+        pe.perform_relocations()?;
         // pe.resolve_imports()?;
         // pe.handle_tls_callbacks()?;
         // pe.call_entry_point()
@@ -220,8 +223,97 @@ impl PE {
         let delta = actual_base - preferred_base;
         info!("Performing relocations with delta: 0x{:x}", delta);
 
-        // TODO: Implement actual relocation processing
-        warn!("Relocation processing not yet implemented");
+        let reloc_dir =
+            self.nt_header.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC.0 as usize];
+
+        // Check if there are any relocations
+        if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
+            info!("No relocation data present");
+            return Ok(());
+        }
+
+        let mut reloc_va = reloc_dir.VirtualAddress as usize;
+        let reloc_size = reloc_dir.Size as usize;
+        let reloc_end = reloc_va + reloc_size;
+
+        debug!(
+            "Relocation directory: VA=0x{:x}, Size=0x{:x}",
+            reloc_dir.VirtualAddress, reloc_size
+        );
+
+        let image_base_ptr = actual_base as *const u8;
+
+        while reloc_va < reloc_end {
+            let block_header =
+                unsafe { &*(image_base_ptr.add(reloc_va) as *const IMAGE_BASE_RELOCATION) };
+
+            debug!(
+                "Processing relocation block at VA 0x{:x}, size {}",
+                block_header.VirtualAddress, block_header.SizeOfBlock
+            );
+
+            if block_header.SizeOfBlock < size_of::<IMAGE_BASE_RELOCATION>() as u32 {
+                error!(
+                    "Invalid relocation block size: {}",
+                    block_header.SizeOfBlock
+                );
+                return Err(anyhow::anyhow!("Invalid relocation block size"));
+            }
+
+            let bytes_per_entry = 2;
+            let num_entries = ((block_header.SizeOfBlock
+                - size_of::<IMAGE_BASE_RELOCATION>() as u32)
+                / bytes_per_entry) as usize;
+
+            debug!("Block contains {} relocation entries", num_entries);
+
+            let entries = unsafe {
+                image_base_ptr.add(reloc_va + size_of::<IMAGE_BASE_RELOCATION>()) as *const u16
+            };
+
+            for i in 0..num_entries {
+                let entry = unsafe { *entries.add(i) };
+                let relocation_type = entry >> 12; // upper 4 bits (usually DIR64 in 64 bit PEs)
+                let relocation_offset = entry & 0xFFF; // lower 12 bits = offset within the block
+
+                debug!(
+                    "Entry {}: type={}, offset=0x{:x}",
+                    i, relocation_type, relocation_offset
+                );
+
+                if relocation_type != IMAGE_REL_BASED_DIR64 as u16 {
+                    debug!("Skipping non-DIR64 relocation type: {}", relocation_type);
+                    continue;
+                }
+
+                // Get the address to relocate
+                let address = (actual_base
+                    + block_header.VirtualAddress as u64
+                    + relocation_offset as u64) as *mut u64;
+
+                if (address as usize) % 8 != 0 {
+                    error!("Misaligned relocation address: 0x{:x}", address as u64);
+                    return Err(anyhow::anyhow!("Misaligned relocation address"));
+                }
+
+                let old_value = unsafe { *address };
+                unsafe { *address = *address + delta };
+                let new_value = unsafe { *address };
+
+                debug!(
+                    "Relocated address 0x{:x}: 0x{:x} -> 0x{:x}",
+                    address as u64, old_value, new_value
+                );
+            }
+
+            reloc_va += block_header.SizeOfBlock as usize;
+            debug!("Moving to next relocation block at VA 0x{:x}", reloc_va);
+        }
+
+        info!(
+            "Completed processing {} bytes of relocation data",
+            reloc_size
+        );
 
         Ok(())
     }
